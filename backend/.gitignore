@@ -1,1 +1,42 @@
-/target
+
+# Variables d'environnement
+.env
+.env.local
+.env.*.local
+
+# Fichiers de configuration sensibles
+config/*.local.toml
+config/secrets/
+
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Fichiers de base de données locale
+*.db
+*.sqlite
+pgdata/
+
+# Fichiers de logs
+logs/
+*.log
+!logs/.gitkeep
+
+# MinIO local data
+minio/data/
+
+# Docker
+docker-compose.override.yml
+
+# IDE et éditeurs
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+tags
+TAGS
+
+# OS
+.DS_Store
+Thumbs.db

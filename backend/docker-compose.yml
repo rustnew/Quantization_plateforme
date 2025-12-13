@@ -1,0 +1,126 @@
+# ================================================================
+# DOCKER COMPOSE - ENVIRONNEMENT DE DÉVELOPPEMENT
+# ================================================================
+# Ce fichier configure tous les services nécessaires pour le développement:
+# - Application Rust (backend)
+# - PostgreSQL (base de données)
+# - Redis (queue jobs)
+# - MinIO (stockage S3 compatible)
+# - pgAdmin (interface admin PostgreSQL)
+#
+# Pour démarrer l'environnement:
+#   docker-compose up -d
+#   docker-compose run --rm app cargo sqlx migrate run
+# ================================================================
+
+version: '3.8'
+
+services:
+  # Service principal: application Rust
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - RUN_MODE=development
+      - DATABASE_URL=postgres://quant_user:quant_pass@db:5432/quant_dev
+      - REDIS_URL=redis://redis:6379
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET=quant-dev
+      - STORAGE_ENCRYPTION_KEY=dev_encryption_key_32_bytes_12345678
+      - JWT_SECRET=dev_jwt_secret_32_bytes_1234567890abcdef
+    volumes:
+      - .:/app
+      - ./target:/app/target
+    depends_on:
+      - db
+      - redis
+      - minio
+    networks:
+      - quantization-network
+
+  # Base de données PostgreSQL
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: quant_dev
+      POSTGRES_USER: quant_user
+      POSTGRES_PASSWORD: quant_pass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d/migrations
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quant_user -d quant_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - quantization-network
+
+  # Redis pour la queue de jobs
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - quantization-network
+
+  # MinIO - stockage S3 compatible
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - miniodata:/data
+      - ./minio/config:/root/.minio
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - quantization-network
+
+  # pgAdmin - interface admin pour PostgreSQL
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    ports:
+      - "8081:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@quantmvp.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    depends_on:
+      - db
+    networks:
+      - quantization-network
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  pgadmin-data:
+
+networks:
+  quantization-network:
+    driver: bridge
