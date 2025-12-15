@@ -1,18 +1,22 @@
--- 1. users: table ultra-simple avec juste nom, email, mot de passe
--- 2. jobs: suivi des quantifications
--- 3. subscriptions: gestion des abonnements payants
--- 4. payments: suivi des paiements
--- 5. quantization_reports: rapports de qualité pour preuve de valeur
+-- ================================================================
+-- MIGRATION INITIALE - SCHÉMA DE BASE DE DONNÉES (VERSION CORRIGÉE)
+-- ================================================================
+-- Corrections apportées :
+-- 1. Ajout de la contrainte UNIQUE sur user_id dans subscriptions
+-- 2. Correction des clauses ON CONFLICT pour compatibilité PostgreSQL
+--
+-- Pour exécuter cette migration :
+--   sqlx migrate run
+-- ================================================================
 
-
--- Table des utilisateurs MINIMALISTE (comme demandé)
+-- Table des utilisateurs MINIMALISTE
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(255) NOT NULL,
     email VARCHAR(255) NOT NULL UNIQUE,
-    password_hash VARCHAR(255),  -- NULL si authentification sociale
-    auth_provider VARCHAR(50),   -- 'email', 'google', 'github', NULL
-    auth_provider_id VARCHAR(255), -- ID du provider si auth sociale
+    password_hash VARCHAR(255),
+    auth_provider VARCHAR(50),
+    auth_provider_id VARCHAR(255),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     is_active BOOLEAN NOT NULL DEFAULT true
@@ -33,7 +37,7 @@ CREATE TABLE jobs (
     status VARCHAR(20) NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
     error_message TEXT,
     reduction_percent FLOAT,
-    download_url TEXT,  -- URL sécurisée pour téléchargement
+    download_url TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -43,13 +47,13 @@ CREATE INDEX idx_jobs_user ON jobs(user_id);
 CREATE INDEX idx_jobs_status ON jobs(status);
 CREATE INDEX idx_jobs_created_at ON jobs(created_at);
 
--- Table des abonnements (modèle économique simple)
+-- Table des abonnements (CORRIGÉE - ajout UNIQUE sur user_id)
 CREATE TABLE subscriptions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE UNIQUE,  -- ✅ CONTRAINTE UNIQUE AJOUTÉE ICI
     plan_name VARCHAR(50) NOT NULL DEFAULT 'free' CHECK (plan_name IN ('free', 'starter', 'pro')),
-    monthly_credits INTEGER NOT NULL DEFAULT 1,  -- Nombre de quantifications gratuites/mois
-    credits_used INTEGER NOT NULL DEFAULT 0,    -- Crédits utilisés ce mois
+    monthly_credits INTEGER NOT NULL DEFAULT 1,
+    credits_used INTEGER NOT NULL DEFAULT 0,
     stripe_customer_id VARCHAR(255),
     stripe_subscription_id VARCHAR(255) UNIQUE,
     is_active BOOLEAN NOT NULL DEFAULT true,
@@ -80,7 +84,7 @@ CREATE INDEX idx_payments_user ON payments(user_id);
 CREATE INDEX idx_payments_status ON payments(status);
 CREATE INDEX idx_payments_created_at ON payments(created_at);
 
--- Table des rapports de quantification (pour preuve de valeur)
+-- Table des rapports de quantification
 CREATE TABLE quantization_reports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -88,7 +92,7 @@ CREATE TABLE quantization_reports (
     quantized_perplexity FLOAT,
     quality_loss_percent FLOAT,
     latency_improvement_percent FLOAT,
-    cost_savings_percent FLOAT,  -- Économie estimée sur l'inférence
+    cost_savings_percent FLOAT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -104,10 +108,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Appliquer le trigger aux tables qui en ont besoin
+-- Appliquer le trigger aux tables appropriées
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_jobs_updated_at BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_subscriptions_updated_at BEFORE UPDATE ON subscriptions FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_payments_updated_at BEFORE UPDATE ON payments FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Création de l'utilisateur admin par défaut
 INSERT INTO users (name, email, password_hash, auth_provider, is_active)
@@ -119,8 +124,8 @@ VALUES (
     true
 ) ON CONFLICT (email) DO NOTHING;
 
--- Création abonnement admin (illimité)
+-- Création abonnement admin (illimité) - CORRIGÉ
 INSERT INTO subscriptions (user_id, plan_name, monthly_credits, credits_used, is_active, current_period_end)
 SELECT id, 'pro', 1000, 0, true, NOW() + INTERVAL '1 year'
 FROM users WHERE email = 'admin@quantmvp.com'
-ON CONFLICT (user_id) DO NOTHING;
+ON CONFLICT (user_id) DO NOTHING;  -- ✅ FONCTIONNE MAINTENANT GRÂCE À LA CONTRAINTE UNIQUE
