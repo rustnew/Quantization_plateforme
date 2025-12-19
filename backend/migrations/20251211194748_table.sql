@@ -1,131 +1,250 @@
--- ================================================================
--- MIGRATION INITIALE - SCHÉMA DE BASE DE DONNÉES (VERSION CORRIGÉE)
--- ================================================================
--- Corrections apportées :
--- 1. Ajout de la contrainte UNIQUE sur user_id dans subscriptions
--- 2. Correction des clauses ON CONFLICT pour compatibilité PostgreSQL
---
--- Pour exécuter cette migration :
---   sqlx migrate run
--- ================================================================
+-- migrations/0001_initial.sql
 
--- Table des utilisateurs MINIMALISTE
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Users table
 CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(255) NOT NULL,
-    email VARCHAR(255) NOT NULL UNIQUE,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255),
-    auth_provider VARCHAR(50),
-    auth_provider_id VARCHAR(255),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    is_active BOOLEAN NOT NULL DEFAULT true
-);
-
--- Index pour connexion rapide
-CREATE INDEX idx_users_email ON users(email);
-CREATE INDEX idx_users_auth ON users(auth_provider, auth_provider_id);
-
--- Table des jobs de quantification
-CREATE TABLE jobs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    model_name VARCHAR(255) NOT NULL,
-    original_size_bytes BIGINT NOT NULL,
-    quantized_size_bytes BIGINT,
-    quantization_method VARCHAR(50) NOT NULL DEFAULT 'int8' CHECK (quantization_method IN ('int8', 'int4', 'gptq', 'awq')),
-    status VARCHAR(20) NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
-    error_message TEXT,
-    reduction_percent FLOAT,
-    download_url TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Index pour performance
-CREATE INDEX idx_jobs_user ON jobs(user_id);
-CREATE INDEX idx_jobs_status ON jobs(status);
-CREATE INDEX idx_jobs_created_at ON jobs(created_at);
-
--- Table des abonnements (CORRIGÉE - ajout UNIQUE sur user_id)
-CREATE TABLE subscriptions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE UNIQUE,  -- ✅ CONTRAINTE UNIQUE AJOUTÉE ICI
-    plan_name VARCHAR(50) NOT NULL DEFAULT 'free' CHECK (plan_name IN ('free', 'starter', 'pro')),
-    monthly_credits INTEGER NOT NULL DEFAULT 1,
-    credits_used INTEGER NOT NULL DEFAULT 0,
     stripe_customer_id VARCHAR(255),
-    stripe_subscription_id VARCHAR(255) UNIQUE,
-    is_active BOOLEAN NOT NULL DEFAULT true,
-    current_period_end TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_login_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
+    
+    CONSTRAINT users_email_check CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
 );
 
--- Index pour gestion abonnements
-CREATE INDEX idx_subscriptions_user ON subscriptions(user_id);
-CREATE INDEX idx_subscriptions_stripe ON subscriptions(stripe_subscription_id);
-CREATE INDEX idx_subscriptions_active ON subscriptions(is_active);
-
--- Table des paiements
-CREATE TABLE payments (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+-- API Keys table
+CREATE TABLE api_keys (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    amount DECIMAL(10,2) NOT NULL,
-    currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
-    description VARCHAR(255) NOT NULL,
-    stripe_payment_id VARCHAR(255) UNIQUE,
-    status VARCHAR(20) NOT NULL DEFAULT 'succeeded' CHECK (status IN ('succeeded', 'failed', 'refunded')),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    key VARCHAR(64) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    permissions JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    
+    INDEX idx_api_keys_user_id (user_id),
+    INDEX idx_api_keys_key (key)
 );
 
--- Index pour analytics
-CREATE INDEX idx_payments_user ON payments(user_id);
-CREATE INDEX idx_payments_status ON payments(status);
-CREATE INDEX idx_payments_created_at ON payments(created_at);
-
--- Table des rapports de quantification
-CREATE TABLE quantization_reports (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    original_perplexity FLOAT,
-    quantized_perplexity FLOAT,
-    quality_loss_percent FLOAT,
-    latency_improvement_percent FLOAT,
-    cost_savings_percent FLOAT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+-- Model files table
+CREATE TABLE model_files (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    original_filename VARCHAR(255) NOT NULL,
+    storage_filename VARCHAR(255) NOT NULL,
+    file_size BIGINT NOT NULL,
+    checksum_sha256 VARCHAR(64) NOT NULL,
+    format VARCHAR(50) NOT NULL,
+    model_type VARCHAR(100),
+    architecture VARCHAR(100),
+    parameter_count DECIMAL(10, 2),
+    storage_bucket VARCHAR(255) NOT NULL,
+    storage_path VARCHAR(1024) NOT NULL,
+    download_token VARCHAR(64),
+    download_expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    
+    INDEX idx_model_files_user_id (user_id),
+    INDEX idx_model_files_checksum (checksum_sha256),
+    INDEX idx_model_files_expires (expires_at)
 );
 
--- Index pour rapports
-CREATE INDEX idx_reports_job ON quantization_reports(job_id);
+-- Job status enum
+CREATE TYPE job_status AS ENUM (
+    'pending',
+    'processing', 
+    'completed',
+    'failed',
+    'cancelled'
+);
 
--- Trigger pour mise à jour automatique de updated_at
+-- Quantization method enum
+CREATE TYPE quantization_method AS ENUM (
+    'int8',
+    'gptq',
+    'awq',
+    'gguf_q4_0',
+    'gguf_q5_0'
+);
+
+-- Model format enum
+CREATE TYPE model_format AS ENUM (
+    'pytorch',
+    'safetensors',
+    'onnx',
+    'gguf'
+);
+
+-- Jobs table
+CREATE TABLE jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    status job_status NOT NULL DEFAULT 'pending',
+    progress INTEGER NOT NULL DEFAULT 0 CHECK (progress >= 0 AND progress <= 100),
+    quantization_method quantization_method NOT NULL,
+    input_format model_format NOT NULL,
+    output_format model_format NOT NULL,
+    input_file_id UUID NOT NULL REFERENCES model_files(id),
+    output_file_id UUID REFERENCES model_files(id),
+    error_message TEXT,
+    original_size BIGINT,
+    quantized_size BIGINT,
+    processing_time INTEGER,
+    credits_used INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    
+    INDEX idx_jobs_user_id (user_id),
+    INDEX idx_jobs_status (status),
+    INDEX idx_jobs_created_at (created_at),
+    INDEX idx_jobs_input_file (input_file_id),
+    INDEX idx_jobs_output_file (output_file_id)
+);
+
+-- Subscription plan enum
+CREATE TYPE subscription_plan AS ENUM (
+    'free',
+    'starter',
+    'pro'
+);
+
+-- Subscription status enum
+CREATE TYPE subscription_status AS ENUM (
+    'active',
+    'past_due',
+    'cancelled',
+    'trialing'
+);
+
+-- Subscriptions table
+CREATE TABLE subscriptions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan subscription_plan NOT NULL DEFAULT 'free',
+    status subscription_status NOT NULL DEFAULT 'active',
+    current_period_start TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    current_period_end TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '30 days',
+    stripe_subscription_id VARCHAR(255),
+    stripe_price_id VARCHAR(255),
+    cancelled_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+    INDEX idx_subscriptions_user_id (user_id),
+    INDEX idx_subscriptions_status (status)
+);
+
+-- Credit transactions table
+CREATE TABLE credit_transactions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    transaction_type VARCHAR(50) NOT NULL,
+    amount INTEGER NOT NULL,
+    balance_after INTEGER NOT NULL,
+    job_id UUID REFERENCES jobs(id),
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+    INDEX idx_credit_transactions_user_id (user_id),
+    INDEX idx_credit_transactions_created_at (created_at)
+);
+
+-- Audit logs table
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id),
+    api_key_id VARCHAR(64),
+    ip_address INET,
+    user_agent TEXT,
+    action VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(50),
+    resource_id UUID,
+    old_values JSONB,
+    new_values JSONB,
+    message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+    INDEX idx_audit_logs_user_id (user_id),
+    INDEX idx_audit_logs_action (action),
+    INDEX idx_audit_logs_created_at (created_at DESC)
+);
+
+-- System metrics table
+CREATE TABLE system_metrics (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    active_users BIGINT NOT NULL DEFAULT 0,
+    total_jobs BIGINT NOT NULL DEFAULT 0,
+    jobs_pending BIGINT NOT NULL DEFAULT 0,
+    jobs_processing BIGINT NOT NULL DEFAULT 0,
+    jobs_completed BIGINT NOT NULL DEFAULT 0,
+    jobs_failed BIGINT NOT NULL DEFAULT 0,
+    queue_size BIGINT NOT NULL DEFAULT 0,
+    memory_usage_mb DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    cpu_usage_percent DECIMAL(5, 2) NOT NULL DEFAULT 0,
+    total_storage_gb DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    used_storage_gb DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    
+    INDEX idx_system_metrics_timestamp (timestamp DESC)
+);
+
+-- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ language 'plpgsql';
 
--- Appliquer le trigger aux tables appropriées
-CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-CREATE TRIGGER update_jobs_updated_at BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-CREATE TRIGGER update_subscriptions_updated_at BEFORE UPDATE ON subscriptions FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-CREATE TRIGGER update_payments_updated_at BEFORE UPDATE ON payments FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+-- Triggers for updated_at
+CREATE TRIGGER update_jobs_updated_at 
+    BEFORE UPDATE ON jobs 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Création de l'utilisateur admin par défaut
-INSERT INTO users (name, email, password_hash, auth_provider, is_active)
+CREATE TRIGGER update_subscriptions_updated_at 
+    BEFORE UPDATE ON subscriptions 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Function to cleanup expired files
+CREATE OR REPLACE FUNCTION cleanup_expired_files()
+RETURNS INTEGER AS $$
+DECLARE
+    deleted_count INTEGER;
+BEGIN
+    DELETE FROM model_files 
+    WHERE expires_at IS NOT NULL 
+    AND expires_at < NOW()
+    RETURNING COUNT(*) INTO deleted_count;
+    
+    RETURN deleted_count;
+END;
+$$ language 'plpgsql';
+
+-- Create admin user (password will be set by application)
+INSERT INTO users (id, email, password_hash, created_at) 
 VALUES (
-    'Admin',
-    'admin@quantmvp.com',
-    '$argon2id$v=19$m=19456,t=2,p=1$cmFuZG9tc2FsdA$/JZP6hY5KqWx7qLXcR5v0Z9yJ6X2H1K8F3G7D9E2B5C8A0',
-    'email',
-    true
-) ON CONFLICT (email) DO NOTHING;
+    '00000000-0000-0000-0000-000000000000',
+    'admin@quantization.io',
+    NULL,
+    NOW()
+) ON CONFLICT DO NOTHING;
 
--- Création abonnement admin (illimité) - CORRIGÉ
-INSERT INTO subscriptions (user_id, plan_name, monthly_credits, credits_used, is_active, current_period_end)
-SELECT id, 'pro', 1000, 0, true, NOW() + INTERVAL '1 year'
-FROM users WHERE email = 'admin@quantmvp.com'
-ON CONFLICT (user_id) DO NOTHING;  -- ✅ FONCTIONNE MAINTENANT GRÂCE À LA CONTRAINTE UNIQUE
+-- Create free subscription for admin
+INSERT INTO subscriptions (id, user_id, plan, status, created_at, updated_at)
+VALUES (
+    '00000000-0000-0000-0000-000000000000',
+    '00000000-0000-0000-0000-000000000000',
+    'free',
+    'active',
+    NOW(),
+    NOW()
+) ON CONFLICT DO NOTHING;

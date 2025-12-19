@@ -1,228 +1,401 @@
-
-
-use actix_cors::Cors;
-use actix_web::{middleware, web, App, HttpServer};
-use std::env;
-use tracing::{info, warn, error};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-
+// backend/src/main.rs
+mod models;
 mod api;
 mod core;
-mod domain;
-mod infrastructure;
-mod workers;
+mod services;
+mod utils;
 
-use infrastructure::{
-    database::Database,
-    python::PythonRuntime,
-    storage::StorageService,
-    queue::RedisQueue,
+use crate::utils::config::Config;
+use crate::utils::error::Result;
+use crate::services::{
+    Database, Cache, JobQueue, FileStorage, 
+    GoogleAuthClient, SendGridClient, PythonClient
 };
-use workers::quantization_worker::{QuantizationWorker, WorkerConfig, start_worker_background};
-
-#[derive(Debug, Clone)]
-pub struct AppState {
-    pub db: Database,
-    pub storage: StorageService,
-    pub queue: RedisQueue,
-    pub python_runtime: PythonRuntime,
-}
+use crate::core::{
+    UserService, JobService, QuantizationService,
+    BillingService, NotificationService, LogEmailProvider
+};
+use actix_web::{web, App, HttpServer};
+use std::sync::Arc;
+use std::path::Path;
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    // Initialisation du logging
-    setup_tracing();
-    info!("🚀 Démarrage de Quantization Platform Backend");
-
-    // Chargement de la configuration
-    let config = load_configuration().expect("❌ Impossible de charger la configuration");
-    info!("✅ Configuration chargée avec succès");
-    info!("🔧 Mode: {}", config.server.run_mode);
+async fn main() -> Result<()> {
+    // 1. Charger la configuration
+    let config = Config::from_env()?;
     
-    // Validation des variables d'environnement critiques
-    validate_environment_variables().expect("❌ Variables d'environnement manquantes");
-
-    // Initialisation des services
-    let db = Database::new(&config.database.url)
-        .await
-        .expect("❌ Impossible de se connecter à la base de données");
+    // 2. Initialiser le logging
+    init_logging(&config)?;
     
-    let storage = StorageService::new(
-        &config.storage.endpoint,
-        &config.storage.access_key,
-        &config.storage.secret_key,
-        &config.storage.bucket,
-    )
-    .expect("❌ Impossible d'initialiser le stockage");
+    // 3. Initialiser les services d'infrastructure
+    let (db, cache, queue, storage) = init_infrastructure(&config).await?;
     
-    let queue = RedisQueue::new(&config.redis.url)
-        .await
-        .expect("❌ Impossible de se connecter à Redis");
+    // 4. Initialiser les services externes
+    let (google_client, email_provider, python_client) = init_external_services(&config);
     
-    let python_runtime = PythonRuntime::new()
-        .expect("❌ Impossible d'initialiser le runtime Python");
-
-    // Vérification des dépendances critiques
-    verify_dependencies(&python_runtime).await;
-
-    // Création de l'état de l'application
-    let app_state = web::Data::new(AppState {
-        db: db.clone(),
-        storage: storage.clone(),
-        queue: queue.clone(),
-        python_runtime: python_runtime.clone(),
-    });
-
-    // Démarrage des workers background
-    let worker_config = WorkerConfig::default();
-    start_worker_background(
-        worker_config,
-        db.clone(),
-        storage.clone(),
-        python_runtime.clone(),
-    ).await.expect("❌ Impossible de démarrer le worker background");
-
-    // Configuration du serveur Actix-Web
-    let server = HttpServer::new(move || {
-        let cors = Cors::default()
-            .allow_any_origin()
-            .allow_any_method()
-            .allow_any_header()
-            .max_age(3600);
-
-        App::new()
-            .wrap(cors)
-            .wrap(middleware::Logger::default())
-            .wrap(middleware::Compress::default())
-            .app_data(app_state.clone())
-            .configure(api::config)
-            .service(actix_files::Files::new("/static", "./static").show_files_listing())
-            .default_service(web::route().to(|| async { "🚀 Quantization Platform Backend est en cours d'exécution!" }))
-    })
-    .bind(format!("{}:{}", config.server.host, config.server.port))?
-    .workers(config.server.workers)
-    .shutdown_timeout(10);
-
-    info!("✅ Backend démarré avec succès!");
-    info!("🔗 API disponible sur http://{}:{}", config.server.host, config.server.port);
-    info!("📊 Documentation Swagger: http://{}:{}/api/docs", config.server.host, config.server.port);
-
-    server.run().await
-}
-
-/// Configure le tracing pour le logging structuré
-fn setup_tracing() {
-    let log_level = env::var("LOG_LEVEL")
-        .unwrap_or_else(|_| "info".into())
-        .parse()
-        .unwrap_or(tracing::Level::INFO);
-
-    let log_format = env::var("LOG_FORMAT").unwrap_or_else(|_| "json".into());
-
-    let subscriber = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(log_level.into()),
-        )
-        .with(if log_format == "json" {
-            Box::new(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .flatten_event(true)
-                    .with_current_span(true)
-                    .with_span_list(true),
-            ) as Box<dyn tracing_subscriber::Layer<_> + Send + Sync>
-        } else {
-            Box::new(
-                tracing_subscriber::fmt::layer()
-                    .compact()
-                    .with_line_number(true)
-                    .with_file(true),
-            ) as Box<dyn tracing_subscriber::Layer<_> + Send + Sync>
-        });
-
-    subscriber.init();
-}
-
-/// Charge la configuration depuis les fichiers et variables d'environnement
-fn load_configuration() -> anyhow::Result<config::Config> {
-    let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
+    // 5. Initialiser les services métier
+    let (user_service, job_service, quant_service, billing_service, notification_service) = 
+        init_business_services(
+            &config, 
+            db, cache, queue.clone(), storage.clone(), 
+            google_client, email_provider, python_client
+        ).await?;
     
-    let mut settings = config::Config::default();
+    // 6. Démarrer les workers background
+    start_background_workers(
+        job_service.clone(), 
+        quant_service.clone(), 
+        &config
+    );
     
-    // Ajout des sources de configuration
-    settings
-        .merge(config::File::with_name("config/base"))?
-        .merge(config::File::with_name(&format!("config/{}", run_mode)))?
-        .merge(config::Environment::with_prefix("APP"))?;
-
-    // Validation des paramètres critiques
-    validate_configuration(&settings)?;
-
-    Ok(settings)
-}
-
-/// Valide les paramètres de configuration critiques
-fn validate_configuration(settings: &config::Config) -> anyhow::Result<()> {
-    // Validation du port
-    let port: u16 = settings.get("server.port")?;
-    if port == 0 || port > 65535 {
-        return Err(anyhow::anyhow!("Port invalide: {}", port));
-    }
-
-    // Validation de l'URL de base de données
-    let _db_url: String = settings.get("database.url")?;
-
-    // Validation de la clé JWT
-    let jwt_secret: String = settings.get("security.jwt_secret")?;
-    if jwt_secret.len() < 32 {
-        warn!("⚠️  JWT_SECRET trop court (< 32 caractères) - risque de sécurité");
-    }
-
-    // Validation de la clé de chiffrement
-    let _encryption_key: String = settings.get("storage.encryption_key")?;
-
+    // 7. Lancer le serveur HTTP
+    start_http_server(
+        config, 
+        user_service, job_service, billing_service, notification_service,
+        queue, storage,
+    ).await?;
+    
     Ok(())
 }
 
-/// Valide les variables d'environnement requises
-fn validate_environment_variables() -> anyhow::Result<()> {
-    let required_vars = vec![
-        "DATABASE_URL",
-        "REDIS_URL",
-        "MINIO_ENDPOINT",
-        "MINIO_ACCESS_KEY",
-        "MINIO_SECRET_KEY",
-        "JWT_SECRET",
-        "STORAGE_ENCRYPTION_KEY"
-    ];
+/// Initialiser le système de logging
+fn init_logging(config: &Config) -> Result<()> {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+    
+    if config.logging_format == "json" {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .init();
+    }
+    
+    log::info!("Logging initialisé avec niveau: {}", config.log_level);
+    Ok(())
+}
 
-    for var in required_vars {
-        if env::var(var).is_err() {
-            error!("❌ Variable d'environnement manquante: {}", var);
-            return Err(anyhow::anyhow!("Variable d'environnement manquante: {}", var));
+/// Initialiser l'infrastructure (DB, Cache, Queue, Storage)
+async fn init_infrastructure(
+    config: &Config,
+) -> Result<(
+    Arc<Database>,
+    Arc<Cache>,
+    Arc<JobQueue>,
+    Arc<FileStorage>,
+)> {
+    log::info!("Initialisation de l'infrastructure...");
+    
+    // Base de données
+    let db = Arc::new(Database::new(&config.database_url).await?);
+    log::info!("✅ Base de données connectée");
+    
+    // Exécuter les migrations
+    db.run_migrations().await?;
+    log::info!("✅ Migrations exécutées");
+    
+    // Cache Redis
+    let cache = Arc::new(
+        Cache::new(
+            &config.redis_url,
+            Some(&config.redis_queue_prefix),
+            config.redis_cache_ttl_seconds,
+        ).await?
+    );
+    log::info!("✅ Cache Redis initialisé");
+    
+    // Queue Redis
+    let queue = Arc::new(
+        JobQueue::new(
+            &config.redis_url,
+            Some(&config.redis_queue_prefix),
+        ).await?
+    );
+    log::info!("✅ Queue Redis initialisée");
+    
+    // Stockage fichiers
+    let storage = Arc::new(FileStorage::new(
+        config.minio_endpoint.as_deref(),
+        config.minio_access_key.as_deref(),
+        config.minio_secret_key.as_deref(),
+        &config.minio_bucket,
+        Some(Path::new("./storage")),
+        if config.storage_encryption_key.is_empty() {
+            None
+        } else {
+            Some(&config.storage_encryption_key)
+        },
+        config.max_file_size_mb,
+    ));
+    log::info!("✅ Stockage initialisé (type: {})", config.storage_type);
+    
+    Ok((db, cache, queue, storage))
+}
+
+/// Initialiser les services externes
+fn init_external_services(
+    config: &Config,
+) -> (
+    Option<Arc<GoogleAuthClient>>,
+    Arc<dyn crate::core::notification_service::EmailProvider + Send + Sync>,
+    Arc<PythonClient>,
+) {
+    log::info!("Initialisation des services externes...");
+    
+    // Client Google OAuth
+    let google_client = if config.enable_google_oauth {
+        config.google_oauth_client_id.as_ref().and_then(|client_id| {
+            config.google_oauth_client_secret.as_ref().map(|client_secret| {
+                Arc::new(GoogleAuthClient::new(
+                    client_id.clone(),
+                    client_secret.clone(),
+                    config.google_oauth_redirect_uri
+                        .clone()
+                        .unwrap_or_else(|| "http://localhost:8080/api/auth/google/callback".to_string()),
+                ))
+            })
+        })
+    } else {
+        None
+    };
+    
+    if google_client.is_some() {
+        log::info!("✅ Google OAuth activé");
+    }
+    
+    // Fournisseur d'emails
+    let email_provider: Arc<dyn crate::core::notification_service::EmailProvider + Send + Sync> = 
+        if config.enable_email_notifications && config.email_provider == "sendgrid" {
+            if let Some(api_key) = &config.sendgrid_api_key {
+                Arc::new(SendGridClient::new(
+                    api_key.clone(),
+                    config.email_from.clone(),
+                    config.email_from_name.clone(),
+                ))
+            } else {
+                log::warn!("SendGrid configuré mais SENDGRID_API_KEY manquant, utilisation du logger");
+                Arc::new(LogEmailProvider)
+            }
+        } else {
+            log::info!("📧 Emails en mode log (développement)");
+            Arc::new(LogEmailProvider)
+        };
+    
+    // Client Python pour la quantification
+    let python_client = Arc::new(PythonClient::new(
+        &config.quantization_python_path,
+        Some("python3"),
+        config.quantization_timeout_seconds,
+    ));
+    log::info!("✅ Client Python initialisé");
+    
+    (google_client, email_provider, python_client)
+}
+
+/// Initialiser les services métier
+async fn init_business_services(
+    config: &Config,
+    db: Arc<Database>,
+    cache: Arc<Cache>,
+    queue: Arc<JobQueue>,
+    storage: Arc<FileStorage>,
+    google_client: Option<Arc<GoogleAuthClient>>,
+    email_provider: Arc<dyn crate::core::notification_service::EmailProvider + Send + Sync>,
+    python_client: Arc<PythonClient>,
+) -> Result<(
+    Arc<UserService>,
+    Arc<JobService>,
+    Arc<QuantizationService>,
+    Arc<BillingService>,
+    Arc<NotificationService>,
+)> {
+    log::info!("Initialisation des services métier...");
+    
+    // Service utilisateur
+    let user_service = Arc::new(UserService::new(
+        db.clone(),
+        cache.clone(),
+        config.jwt_secret.clone(),
+        config.admin_email.clone(),
+        config.admin_password.clone(),
+    ));
+    log::info!("✅ Service utilisateur initialisé");
+    
+    // Service de quantification
+    let work_dir = Path::new("./work").to_path_buf();
+    std::fs::create_dir_all(&work_dir).ok();
+    
+    let quant_service = Arc::new(QuantizationService::new(
+        python_client.clone(),
+        config.quantization_gpu_enabled,
+        config.quantization_timeout_seconds,
+        config.quantization_max_retries,
+        work_dir,
+        config.quantization_max_concurrent_jobs,
+    ));
+    log::info!("✅ Service de quantification initialisé");
+    
+    // Service de jobs
+    let job_service = Arc::new(JobService::new(
+        db.clone(),
+        queue.clone(),
+        storage.clone(),
+        quant_service.clone(),
+        config.quantization_max_concurrent_jobs,
+    ));
+    log::info!("✅ Service de jobs initialisé");
+    
+    // Service de facturation
+    let billing_service = Arc::new(BillingService::new(
+        db.clone(),
+        config.stripe_secret_key.clone().unwrap_or_default(),
+        config.stripe_webhook_secret.clone().unwrap_or_default(),
+        config.stripe_currency.clone(),
+        config.stripe_trial_period_days,
+    ));
+    log::info!("✅ Service de facturation initialisé");
+    
+    // Service de notifications
+    let notification_service = Arc::new(NotificationService::new(
+        email_provider,
+        None, // Pas de SMS pour le MVP
+        config.frontend_url.clone(),
+    ));
+    log::info!("✅ Service de notifications initialisé");
+    
+    // Créer l'utilisateur admin si nécessaire
+    init_admin_user(&user_service, config).await?;
+    
+    Ok((user_service, job_service, quant_service, billing_service, notification_service))
+}
+
+/// Créer l'utilisateur admin
+async fn init_admin_user(user_service: &UserService, config: &Config) -> Result<()> {
+    match user_service.register_user(&config.admin_email, &config.admin_password).await {
+        Ok(user) => {
+            log::info!("✅ Utilisateur admin créé: {}", user.email);
+            Ok(())
+        }
+        Err(AppError::UserAlreadyExists) => {
+            log::info!("👤 Utilisateur admin déjà existant");
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("❌ Erreur lors de la création de l'utilisateur admin: {}", e);
+            Err(e)
         }
     }
+}
 
+/// Démarrer les workers background
+fn start_background_workers(
+    job_service: Arc<JobService>,
+    quant_service: Arc<QuantizationService>,
+    config: &Config,
+) {
+    // Worker de traitement des jobs
+    let job_service_clone = job_service.clone();
+    tokio::spawn(async move {
+        log::info!("🚀 Démarrage du worker de jobs...");
+        job_service_clone.start_worker(5).await; // Vérifie toutes les 5 secondes
+    });
+    
+    // Worker de nettoyage des fichiers temporaires
+    let quant_service_clone = quant_service.clone();
+    tokio::spawn(async move {
+        let interval = tokio::time::Duration::from_secs(3600); // Toutes les heures
+        
+        loop {
+            tokio::time::sleep(interval).await;
+            
+            match quant_service_clone.cleanup_old_files(7).await { // 7 jours
+                Ok(deleted) if deleted > 0 => {
+                    log::info!("🧹 {} fichiers temporaires nettoyés", deleted);
+                }
+                _ => {}
+            }
+        }
+    });
+    
+    log::info!("✅ Workers background démarrés");
+}
+
+/// Démarrer le serveur HTTP
+async fn start_http_server(
+    config: Config,
+    user_service: Arc<UserService>,
+    job_service: Arc<JobService>,
+    billing_service: Arc<BillingService>,
+    notification_service: Arc<NotificationService>,
+    queue: Arc<JobQueue>,
+    storage: Arc<FileStorage>,
+) -> Result<()> {
+    let host = config.server_host.clone();
+    let port = config.server_port;
+    
+    log::info!("🌍 Démarrage du serveur sur {}:{}", host, port);
+    log::info!("📊 Mode: {}", config.run_mode);
+    log::info!("👷 Workers: {}", config.workers);
+    
+    HttpServer::new(move || {
+        App::new()
+            // Données de configuration
+            .app_data(web::Data::new(config.clone()))
+            
+            // Services métier
+            .app_data(web::Data::new(user_service.clone()))
+            .app_data(web::Data::new(job_service.clone()))
+            .app_data(web::Data::new(billing_service.clone()))
+            .app_data(web::Data::new(notification_service.clone()))
+            
+            // Services d'infrastructure
+            .app_data(web::Data::new(queue.clone()))
+            .app_data(web::Data::new(storage.clone()))
+            
+            // Middleware
+            .wrap(actix_web::middleware::Logger::default())
+            .wrap(actix_cors::Cors::default()
+                .allow_any_origin()
+                .allow_any_method()
+                .allow_any_header()
+                .max_age(3600))
+            .wrap(actix_web::middleware::Compress::default())
+            .wrap(actix_web::middleware::NormalizePath::trim())
+            
+            // Routes API
+            .configure(api::configure_routes)
+            
+            // Health check
+            .route("/health", web::get().to(health_check))
+            .route("/ready", web::get().to(ready_check))
+    })
+    .workers(config.workers)
+    .bind((host, port))?
+    .run()
+    .await
+    .map_err(|e| AppError::Internal)?;
+    
     Ok(())
 }
 
-/// Vérifie les dépendances critiques avant le démarrage
-async fn verify_dependencies(python_runtime: &PythonRuntime) {
-    info!("🔍 Vérification des dépendances...");
+/// Health check endpoint
+async fn health_check() -> actix_web::HttpResponse {
+    actix_web::HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "service": "quantization-platform",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
 
-    // Vérification ONNX Runtime
-    match ort::Environment::builder().build() {
-        Ok(_) => info!("✅ ONNX Runtime: prêt"),
-        Err(e) => warn!("⚠️  ONNX Runtime: {}", e),
-    }
-
-    // Vérification bindings Python
-    match python_runtime.test_gptq_connection().await {
-        Ok(_) => info!("✅ Python runtime (GPTQ): prêt"),
-        Err(e) => warn!("⚠️  Python runtime (GPTQ): {}", e),
-    }
-
-    info!("✅ Toutes les dépendances vérifiées!");
+/// Ready check endpoint
+async fn ready_check() -> actix_web::HttpResponse {
+    actix_web::HttpResponse::Ok().json(serde_json::json!({
+        "status": "ready",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
 }
